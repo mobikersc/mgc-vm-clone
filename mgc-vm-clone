@@ -1,0 +1,777 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$ROOT_DIR/lib"
+
+SOURCE_TENANT=""
+SOURCE_VM=""
+SOURCE_REGION="br-se1"
+SOURCE_SSH_HOST=""
+SOURCE_SSH_USER="ubuntu"
+SOURCE_SSH_KEY=""
+SNAPSHOT_ID=""
+SAFETY_SNAPSHOT=1
+QUIESCE_DOCKER=1
+
+TARGET_TENANT=""
+TARGET_REGION="br-se1"
+TARGET_NAME=""
+CUSTOM_IMAGE_NAME=""
+TARGET_VM_NAME=""
+TARGET_AZ="br-se1-c"
+TARGET_VPC="vpc_default"
+TARGET_SSH_KEY=""
+TARGET_MACHINE_TYPE=""
+SECURITY_GROUP_ID=""
+ASSOCIATE_PUBLIC_IP=1
+IDENTITY_FILE=""
+VALIDATION_HOST=""
+SKIP_VALIDATION=0
+VALIDATION_HOST_SET=0
+IDENTITY_FILE_SET=0
+TARGET_MACHINE_TYPE_SET=0
+TARGET_SSH_KEY_SET=0
+
+REQ_VCPU=""
+REQ_RAM=""
+REQ_DISK=""
+
+WORKDIR=""
+RESUME=0
+EXECUTE=0
+STATUS_DIR=""
+NEW_CUSTOM_IMAGE_NAME=""
+
+ADOPT_FINAL_IMAGE=""
+ADOPT_CUSTOM_IMAGE_ID=""
+ADOPT_VM_ID=""
+
+ORIGINAL_TENANT=""
+STATE=""
+LOG_DIR=""
+
+usage(){
+cat <<'USAGE'
+mgc-vm-clone v1.0
+
+Clone uma VM MGC entre tenants com checkpoint/resume.
+
+FLUXO:
+  1. preflight da origem
+  2. snapshot de segurança + export /dev/vda -> QCOW2
+  3. sanitização offline
+  4. remoção de rede/MAC herdados + validação
+  5. upload temporário + Custom Image no tenant destino
+  6. seleção automática de flavor com disco compatível
+  7. criação da VM
+  8. validação SSH/cloud-init/rede/Docker
+
+Sem --execute, realiza somente preflight e NÃO cria recursos.
+
+EXEMPLO:
+  ./mgc-vm-clone \
+    --source-tenant <tenant-A> \
+    --source-vm <nome-ou-uuid> \
+    --source-ssh-host <ip> \
+    --target-tenant <tenant-B> \
+    --target-name meu-clone \
+    --target-ssh-key minha-chave \
+    --target-az br-se1-c \
+    --workdir /var/tmp/meu-clone \
+    --execute
+
+RETOMADA:
+  ./mgc-vm-clone --resume /var/tmp/meu-clone
+
+Se uma Custom Image ficar com nome preso após erro ambíguo:
+  ./mgc-vm-clone \
+    --resume /var/tmp/meu-clone \
+    --new-custom-image-name meu-clone-retry2
+
+STATUS:
+  ./mgc-vm-clone --status /var/tmp/meu-clone
+
+ORIGEM:
+  --source-tenant <uuid>       obrigatório em nova execução
+  --source-vm <nome|uuid>      obrigatório
+  --source-region <região>     default br-se1
+  --source-ssh-host <ip|host>  obrigatório para export
+  --source-ssh-user <user>     default ubuntu
+  --source-ssh-key <arquivo>   opcional
+  --snapshot-id <uuid>         reutiliza snapshot existente
+  --no-safety-snapshot         não cria snapshot de segurança
+  --no-quiesce-docker          não para Docker/containerd durante captura
+
+DESTINO:
+  --target-tenant <uuid>       obrigatório
+  --target-name <nome>         base para Custom Image e VM
+  --custom-image-name <nome>   default: <target-name>-image
+  --target-vm-name <nome>      default: <target-name>
+  --target-region <região>     default br-se1
+  --target-az <AZ>             default br-se1-c
+  --target-vpc <nome>          default vpc_default
+  --target-ssh-key <nome>      obrigatório para criar a VM
+  --target-machine-type <tipo> opcional; se omitido, seleciona automaticamente
+  --security-group-id <uuid>   opcional
+  --no-public-ip               não associa IPv4 público
+  --identity-file <arquivo>    opcional para validação SSH
+  --validation-host <host>     força host usado na validação final
+  --skip-validation            não executa validação SSH final
+
+REQUISITOS DA CUSTOM IMAGE:
+  --requirements-vcpu <n>      normalmente derivado do flavor da origem
+  --requirements-ram <GB>      normalmente derivado do flavor da origem
+  --requirements-disk <GB>     default calculado: ceil(virtual_bytes/1e9)
+
+PONTOS DE ENTRADA / ADOÇÃO:
+  --adopt-final-image <qcow2>  pula export/sanitização
+  --adopt-custom-image-id <id> pula até Custom Image
+  --adopt-vm-id <id>           pula até VM criada e faz validação
+
+CONTROLE:
+  --workdir <dir>              checkpoint e artefatos
+  --execute
+  --resume <workdir>
+  --new-custom-image-name <n>  apenas em resume ambíguo
+  --status <workdir>
+  --version
+USAGE
+}
+
+log(){ printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
+ok(){ printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
+die(){ printf '\033[1;31m[ERRO]\033[0m %s\n' "$*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Dependência ausente: $1"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --source-tenant) SOURCE_TENANT="${2:?}"; shift 2 ;;
+    --source-vm) SOURCE_VM="${2:?}"; shift 2 ;;
+    --source-region) SOURCE_REGION="${2:?}"; shift 2 ;;
+    --source-ssh-host) SOURCE_SSH_HOST="${2:?}"; shift 2 ;;
+    --source-ssh-user) SOURCE_SSH_USER="${2:?}"; shift 2 ;;
+    --source-ssh-key) SOURCE_SSH_KEY="${2:?}"; shift 2 ;;
+    --snapshot-id) SNAPSHOT_ID="${2:?}"; SAFETY_SNAPSHOT=0; shift 2 ;;
+    --no-safety-snapshot) SAFETY_SNAPSHOT=0; shift ;;
+    --no-quiesce-docker) QUIESCE_DOCKER=0; shift ;;
+
+    --target-tenant) TARGET_TENANT="${2:?}"; shift 2 ;;
+    --target-name) TARGET_NAME="${2:?}"; shift 2 ;;
+    --custom-image-name) CUSTOM_IMAGE_NAME="${2:?}"; shift 2 ;;
+    --target-vm-name) TARGET_VM_NAME="${2:?}"; shift 2 ;;
+    --target-region) TARGET_REGION="${2:?}"; shift 2 ;;
+    --target-az) TARGET_AZ="${2:?}"; shift 2 ;;
+    --target-vpc) TARGET_VPC="${2:?}"; shift 2 ;;
+    --target-ssh-key) TARGET_SSH_KEY="${2:?}"; TARGET_SSH_KEY_SET=1; shift 2 ;;
+    --target-machine-type) TARGET_MACHINE_TYPE="${2:?}"; TARGET_MACHINE_TYPE_SET=1; shift 2 ;;
+    --security-group-id) SECURITY_GROUP_ID="${2:?}"; shift 2 ;;
+    --no-public-ip) ASSOCIATE_PUBLIC_IP=0; shift ;;
+    --identity-file) IDENTITY_FILE="${2:?}"; IDENTITY_FILE_SET=1; shift 2 ;;
+    --validation-host) VALIDATION_HOST="${2:?}"; VALIDATION_HOST_SET=1; shift 2 ;;
+    --skip-validation) SKIP_VALIDATION=1; shift ;;
+
+    --requirements-vcpu) REQ_VCPU="${2:?}"; shift 2 ;;
+    --requirements-ram) REQ_RAM="${2:?}"; shift 2 ;;
+    --requirements-disk) REQ_DISK="${2:?}"; shift 2 ;;
+
+    --adopt-final-image) ADOPT_FINAL_IMAGE="${2:?}"; shift 2 ;;
+    --adopt-custom-image-id) ADOPT_CUSTOM_IMAGE_ID="${2:?}"; shift 2 ;;
+    --adopt-vm-id) ADOPT_VM_ID="${2:?}"; shift 2 ;;
+
+    --workdir) WORKDIR="${2:?}"; shift 2 ;;
+    --resume) RESUME=1; WORKDIR="${2:?}"; EXECUTE=1; shift 2 ;;
+    --new-custom-image-name) NEW_CUSTOM_IMAGE_NAME="${2:?}"; shift 2 ;;
+    --status) STATUS_DIR="${2:?}"; shift 2 ;;
+    --execute) EXECUTE=1; shift ;;
+    --version) echo "$VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Opção desconhecida: $1" ;;
+  esac
+done
+
+if [[ -n "$STATUS_DIR" ]]; then
+  command -v jq >/dev/null 2>&1 || die "Dependência ausente para --status: jq"
+  sf="$STATUS_DIR/state.json"
+  [[ -f "$sf" ]] || die "State não encontrado: $sf"
+  jq . "$sf"
+  exit 0
+fi
+
+for f in export.sh prepare.sh fix-network.sh validate-portable.sh import.sh import-resume.sh create-vm.sh validate-clone.sh; do
+  [[ -x "$LIB_DIR/$f" ]] || die "Componente ausente: $LIB_DIR/$f"
+done
+for c in mgc jq python3 qemu-img qemu-nbd ssh sha256sum numfmt awk sed grep date tee zstd dd lsblk fdisk partprobe partx udevadm mount umount truncate; do need "$c"; done
+
+clean_cli_text(){
+  python3 - "$1" <<'PY'
+import re,sys
+s=open(sys.argv[1],'rb').read().decode('utf-8','replace')
+s=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',s).replace('\r','\n')
+print(s,end='')
+PY
+}
+
+extract_first_uuid(){
+  python3 - "$1" <<'PY'
+import re,sys
+s=open(sys.argv[1],'rb').read().decode('utf-8','replace')
+s=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',s)
+m=re.search(r'(?i)\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b',s)
+print(m.group(1) if m else '')
+PY
+}
+
+current_tenant(){
+  local f
+  f="$(mktemp)"
+  mgc auth tenant current >"$f" 2>&1 || { rm -f "$f"; return 1; }
+  python3 - "$f" <<'PY'
+import re,sys
+s=open(sys.argv[1],'rb').read().decode('utf-8','replace')
+s=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',s).replace('\r','\n')
+m=re.search(r'(?mi)^[ \t]*uuid[ \t]*:[ \t]*["\']?([0-9a-f-]{36})',s)
+print(m.group(1) if m else '')
+PY
+  rm -f "$f"
+}
+
+switch_tenant(){
+  local wanted="$1" cur
+  cur="$(current_tenant || true)"
+  if [[ "$cur" != "$wanted" ]]; then
+    local f="${LOG_DIR:-/tmp}/tenant-set-${wanted:0:8}.log"
+    mgc auth tenant set "$wanted" >"$f" 2>&1 || die "Não consegui selecionar tenant $wanted"
+  fi
+  cur="$(current_tenant || true)"
+  [[ "$cur" == "$wanted" ]] || die "Tenant ativo não corresponde a $wanted"
+}
+
+restore_tenant(){
+  local rc=$?
+  if [[ -n "$ORIGINAL_TENANT" ]]; then
+    local cur
+    cur="$(current_tenant || true)"
+    if [[ -n "$cur" && "$cur" != "$ORIGINAL_TENANT" ]]; then
+      mgc auth tenant set "$ORIGINAL_TENANT" >/dev/null 2>&1 || true
+    fi
+  fi
+  return "$rc"
+}
+
+state_set_string(){
+  local expr="$1" val="$2" tmp="$STATE.tmp"
+  jq --arg v "$val" "$expr = \$v" "$STATE" >"$tmp" && mv "$tmp" "$STATE"
+}
+state_set_json(){
+  local expr="$1" val="$2" tmp="$STATE.tmp"
+  jq --argjson v "$val" "$expr = \$v" "$STATE" >"$tmp" && mv "$tmp" "$STATE"
+}
+state_get(){ jq -r "$1 // empty" "$STATE"; }
+phase(){ state_get ".phases.$1"; }
+phase_set(){ state_set_string ".phases.$1" "$2"; }
+
+load_state_config(){
+  SOURCE_TENANT="$(state_get '.config.source_tenant')"
+  SOURCE_VM="$(state_get '.config.source_vm')"
+  SOURCE_REGION="$(state_get '.config.source_region')"
+  SOURCE_SSH_HOST="$(state_get '.config.source_ssh_host')"
+  SOURCE_SSH_USER="$(state_get '.config.source_ssh_user')"
+  SOURCE_SSH_KEY="$(state_get '.config.source_ssh_key')"
+  SNAPSHOT_ID="$(state_get '.artifacts.snapshot_id')"
+  TARGET_TENANT="$(state_get '.config.target_tenant')"
+  TARGET_REGION="$(state_get '.config.target_region')"
+  TARGET_NAME="$(state_get '.config.target_name')"
+  CUSTOM_IMAGE_NAME="$(state_get '.config.custom_image_name')"
+  TARGET_VM_NAME="$(state_get '.config.target_vm_name')"
+  TARGET_AZ="$(state_get '.config.target_az')"
+  TARGET_VPC="$(state_get '.config.target_vpc')"
+  TARGET_SSH_KEY="$(state_get '.config.target_ssh_key')"
+  TARGET_MACHINE_TYPE="$(state_get '.artifacts.target_machine_type')"
+  [[ -n "$TARGET_MACHINE_TYPE" ]] || TARGET_MACHINE_TYPE="$(state_get '.config.target_machine_type')"
+  SECURITY_GROUP_ID="$(state_get '.config.security_group_id')"
+  IDENTITY_FILE="$(state_get '.config.identity_file')"
+  VALIDATION_HOST="$(state_get '.config.validation_host')"
+  REQ_VCPU="$(state_get '.requirements.vcpu')"
+  REQ_RAM="$(state_get '.requirements.ram_gb')"
+  REQ_DISK="$(state_get '.requirements.disk_gb')"
+  local p
+  p="$(state_get '.config.associate_public_ip')"; [[ "$p" == "false" ]] && ASSOCIATE_PUBLIC_IP=0 || ASSOCIATE_PUBLIC_IP=1
+  p="$(state_get '.config.skip_validation')"; [[ "$p" == "true" ]] && SKIP_VALIDATION=1 || SKIP_VALIDATION=0
+}
+
+capture_source_machine_id(){
+  local args=(-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
+  [[ -n "$SOURCE_SSH_KEY" ]] && args+=(-i "$SOURCE_SSH_KEY")
+  ssh "${args[@]}" "$SOURCE_SSH_USER@$SOURCE_SSH_HOST" 'cat /etc/machine-id' 2>/dev/null | head -n1 || true
+}
+
+parse_flavor(){
+  python3 - "$1" <<'PY'
+import re,sys,json
+s=sys.argv[1]
+m=re.match(r'^(.*?)(\d+)-(\d+)-(\d+)$',s)
+if not m:
+    print('{}')
+else:
+    print(json.dumps({'prefix':m.group(1),'vcpu':int(m.group(2)),'ram':int(m.group(3)),'disk':int(m.group(4))}))
+PY
+}
+
+calc_requirements(){
+  local img="$1" source_mt="$2" info vbytes parsed
+  info="$LOG_DIR/final-image-info.json"
+  qemu-img info --output=json "$img" >"$info"
+  vbytes="$(jq -r '."virtual-size"' "$info")"
+  if [[ -z "$REQ_DISK" ]]; then
+    REQ_DISK="$(python3 - "$vbytes" <<'PY'
+import math,sys
+print(math.ceil(int(sys.argv[1])/1_000_000_000))
+PY
+)"
+  fi
+  parsed="$(parse_flavor "$source_mt")"
+  if [[ -z "$REQ_VCPU" ]]; then REQ_VCPU="$(jq -r '.vcpu // empty' <<<"$parsed")"; fi
+  if [[ -z "$REQ_RAM" ]]; then REQ_RAM="$(jq -r '.ram // empty' <<<"$parsed")"; fi
+  if [[ -z "$REQ_VCPU" || -z "$REQ_RAM" ]]; then
+    if [[ -n "$TARGET_MACHINE_TYPE" ]]; then
+      parsed="$(parse_flavor "$TARGET_MACHINE_TYPE")"
+      [[ -n "$REQ_VCPU" ]] || REQ_VCPU="$(jq -r '.vcpu // empty' <<<"$parsed")"
+      [[ -n "$REQ_RAM" ]] || REQ_RAM="$(jq -r '.ram // empty' <<<"$parsed")"
+    fi
+  fi
+  [[ -n "$REQ_VCPU" && -n "$REQ_RAM" ]] || die "Não consegui derivar vCPU/RAM. Informe --requirements-vcpu e --requirements-ram."
+  state_set_json '.requirements.virtual_size_bytes' "$vbytes"
+  state_set_json '.requirements.disk_gb' "$REQ_DISK"
+  state_set_json '.requirements.vcpu' "$REQ_VCPU"
+  state_set_json '.requirements.ram_gb' "$REQ_RAM"
+  log "Requisitos calculados: ${REQ_VCPU} vCPU / ${REQ_RAM} GB RAM / ${REQ_DISK} GB disco mínimo"
+}
+
+select_machine_type(){
+  if [[ -n "$TARGET_MACHINE_TYPE" ]]; then
+    state_set_string '.artifacts.target_machine_type' "$TARGET_MACHINE_TYPE"
+    return 0
+  fi
+  local source_mt parsed prefix raw clean chosen
+  source_mt="$(state_get '.source.machine_type')"
+  parsed="$(parse_flavor "$source_mt")"
+  prefix="$(jq -r '.prefix // empty' <<<"$parsed")"
+  [[ -n "$prefix" ]] || die "Não consegui selecionar flavor automaticamente a partir de '$source_mt'. Use --target-machine-type."
+
+  switch_tenant "$TARGET_TENANT"
+  raw="$LOG_DIR/machine-types.raw"
+  mgc virtual-machine machine-types list --availability-zone "$TARGET_AZ" --region "$TARGET_REGION" -o json -r >"$raw" 2>&1 \
+    || die "Falha ao listar machine types em $TARGET_AZ"
+
+  chosen="$(python3 - "$raw" "$prefix" "$REQ_VCPU" "$REQ_RAM" "$REQ_DISK" <<'PY'
+import json,re,sys
+path,prefix,vcpu,ram,mindisk=sys.argv[1],sys.argv[2],int(sys.argv[3]),int(sys.argv[4]),int(sys.argv[5])
+raw=open(path,'rb').read().decode('utf-8','replace')
+raw=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',raw)
+dec=json.JSONDecoder(); obj=None
+for i,c in enumerate(raw):
+    if c not in '[{': continue
+    try: obj,_=dec.raw_decode(raw[i:]); break
+    except: pass
+names=[]
+def walk(x):
+    if isinstance(x,dict):
+        if isinstance(x.get('name'),str): names.append(x['name'])
+        for v in x.values(): walk(v)
+    elif isinstance(x,list):
+        for v in x: walk(v)
+walk(obj)
+cands=[]
+for name in set(names):
+    m=re.match(r'^(.*?)(\d+)-(\d+)-(\d+)$',name)
+    if not m: continue
+    if m.group(1)==prefix and int(m.group(2))==vcpu and int(m.group(3))==ram and int(m.group(4))>=mindisk:
+        cands.append((int(m.group(4)),name))
+if cands: print(sorted(cands)[0][1])
+PY
+)"
+  [[ -n "$chosen" ]] || die "Nenhum flavor ${prefix}${REQ_VCPU}-${REQ_RAM}-<disk>=${REQ_DISK} encontrado em $TARGET_AZ. Informe --target-machine-type."
+  TARGET_MACHINE_TYPE="$chosen"
+  state_set_string '.artifacts.target_machine_type' "$chosen"
+  ok "Flavor selecionado automaticamente: $chosen (disco mínimo da imagem: ${REQ_DISK} GB)"
+}
+
+poll_vm_by_id(){
+  local id="$1" start now out pair st status
+  start="$(date +%s)"
+  switch_tenant "$TARGET_TENANT"
+  while true; do
+    out="$LOG_DIR/vm-recover-get.log"
+    if mgc virtual-machine instances get --id "$id" --region "$TARGET_REGION" -o json -r >"$out" 2>&1; then
+      pair="$(python3 - "$out" <<'PY'
+import json,re,sys
+raw=open(sys.argv[1],'rb').read().decode('utf-8','replace')
+raw=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',raw)
+dec=json.JSONDecoder(); obj=None
+for i,c in enumerate(raw):
+    if c not in '[{':continue
+    try:obj,_=dec.raw_decode(raw[i:]);break
+    except:pass
+def f(x,k):
+    if isinstance(x,dict):
+        if isinstance(x.get(k),str):return x[k].lower()
+        for v in x.values():
+            r=f(v,k)
+            if r:return r
+    elif isinstance(x,list):
+        for v in x:
+            r=f(v,k)
+            if r:return r
+    return ''
+print(f(obj,'state')+'|'+f(obj,'status'))
+PY
+)"
+      st="${pair%%|*}"; status="${pair#*|}"
+      printf '\r[INFO] VM state=%-10s status=%-12s' "${st:-?}" "${status:-?}" >&2
+      if [[ "$st" == "running" && "$status" == "completed" ]]; then echo >&2; break; fi
+    fi
+    now="$(date +%s)"; (( now-start < 1800 )) || { echo >&2; die "Timeout recuperando VM $id"; }
+    sleep 10
+  done
+  python3 - "$out" <<'PY'
+import re,sys,ipaddress
+s=open(sys.argv[1],'rb').read().decode('utf-8','replace')
+ips=[]
+for m in re.finditer(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])',s):
+    ip=m.group(0)
+    try:a=ipaddress.ip_address(ip)
+    except:continue
+    if ip not in ips:ips.append(ip)
+for ip in ips:
+    a=ipaddress.ip_address(ip)
+    print(('private' if a.is_private else 'public')+'|'+ip)
+PY
+}
+
+# -------- resume/new config --------
+if [[ "$RESUME" -eq 1 ]]; then
+  [[ -n "$WORKDIR" ]] || die "--resume exige workdir"
+  STATE="$WORKDIR/state.json"; LOG_DIR="$WORKDIR/logs"
+  [[ -f "$STATE" ]] || die "State não encontrado: $STATE"
+  mkdir -p "$LOG_DIR"
+  _ov_validation="$VALIDATION_HOST"; _ov_identity="$IDENTITY_FILE"; _ov_mt="$TARGET_MACHINE_TYPE"; _ov_key="$TARGET_SSH_KEY"
+  load_state_config
+  if [[ "$VALIDATION_HOST_SET" -eq 1 ]]; then VALIDATION_HOST="$_ov_validation"; state_set_string '.config.validation_host' "$VALIDATION_HOST"; fi
+  if [[ "$IDENTITY_FILE_SET" -eq 1 ]]; then IDENTITY_FILE="$_ov_identity"; state_set_string '.config.identity_file' "$IDENTITY_FILE"; fi
+  if [[ "$TARGET_MACHINE_TYPE_SET" -eq 1 ]]; then TARGET_MACHINE_TYPE="$_ov_mt"; state_set_string '.config.target_machine_type' "$TARGET_MACHINE_TYPE"; state_set_string '.artifacts.target_machine_type' "$TARGET_MACHINE_TYPE"; phase_set machine_type pending; fi
+  if [[ "$TARGET_SSH_KEY_SET" -eq 1 ]]; then TARGET_SSH_KEY="$_ov_key"; state_set_string '.config.target_ssh_key' "$TARGET_SSH_KEY"; fi
+  if [[ -n "$NEW_CUSTOM_IMAGE_NAME" ]]; then
+    [[ -z "$(state_get '.artifacts.custom_image_id')" ]] || die "Já existe Custom Image ID; não troque o nome."
+    CUSTOM_IMAGE_NAME="$NEW_CUSTOM_IMAGE_NAME"
+    state_set_string '.config.custom_image_name' "$CUSTOM_IMAGE_NAME"
+    phase_set import pending
+    warn "Nome da Custom Image alterado para recuperação: $CUSTOM_IMAGE_NAME"
+  fi
+else
+  [[ -n "$SOURCE_TENANT" || -n "$ADOPT_CUSTOM_IMAGE_ID" || -n "$ADOPT_VM_ID" ]] || die "Informe --source-tenant"
+  [[ -n "$SOURCE_VM" || -n "$ADOPT_FINAL_IMAGE" || -n "$ADOPT_CUSTOM_IMAGE_ID" || -n "$ADOPT_VM_ID" ]] || die "Informe --source-vm"
+  [[ -n "$TARGET_TENANT" ]] || die "Informe --target-tenant"
+  [[ -n "$TARGET_NAME" ]] || die "Informe --target-name"
+  CUSTOM_IMAGE_NAME="${CUSTOM_IMAGE_NAME:-${TARGET_NAME}-image}"
+  TARGET_VM_NAME="${TARGET_VM_NAME:-$TARGET_NAME}"
+  if [[ -z "$ADOPT_FINAL_IMAGE" && -z "$ADOPT_CUSTOM_IMAGE_ID" && -z "$ADOPT_VM_ID" ]]; then
+    [[ -n "$SOURCE_SSH_HOST" ]] || die "Informe --source-ssh-host"
+  fi
+  if [[ -z "$ADOPT_VM_ID" ]]; then
+    [[ -n "$TARGET_SSH_KEY" ]] || die "Informe --target-ssh-key"
+  fi
+fi
+
+ORIGINAL_TENANT="$(current_tenant || true)"
+trap restore_tenant EXIT
+trap 'exit 130' HUP INT TERM
+
+# -------- preflight --------
+if [[ "$EXECUTE" -eq 0 ]]; then
+  echo "============================================================"
+  echo " PREFLIGHT - MGC VM CLONE v$VERSION"
+  echo "============================================================"
+  echo "Origem tenant:  $SOURCE_TENANT"
+  echo "Origem VM:      ${SOURCE_VM:-adotada}"
+  echo "Destino tenant: $TARGET_TENANT"
+  echo "Nome destino:   $TARGET_NAME"
+  echo "Custom Image:   $CUSTOM_IMAGE_NAME"
+  echo "VM destino:     $TARGET_VM_NAME"
+  echo
+
+  if [[ -z "$ADOPT_FINAL_IMAGE" && -z "$ADOPT_CUSTOM_IMAGE_ID" && -z "$ADOPT_VM_ID" ]]; then
+    switch_tenant "$SOURCE_TENANT"
+    args=(--vm "$SOURCE_VM" --region "$SOURCE_REGION" --ssh-host "$SOURCE_SSH_HOST" --ssh-user "$SOURCE_SSH_USER")
+    [[ -n "$SOURCE_SSH_KEY" ]] && args+=(--ssh-key "$SOURCE_SSH_KEY")
+    [[ "$QUIESCE_DOCKER" -eq 1 ]] && args+=(--quiesce-docker)
+    if [[ -n "$SNAPSHOT_ID" ]]; then args+=(--snapshot-id "$SNAPSHOT_ID"); elif [[ "$SAFETY_SNAPSHOT" -eq 1 ]]; then args+=(--safety-snapshot); fi
+    "$LIB_DIR/export.sh" "${args[@]}"
+  elif [[ -n "$ADOPT_FINAL_IMAGE" ]]; then
+    [[ -f "$ADOPT_FINAL_IMAGE" ]] || die "Imagem adotada não existe: $ADOPT_FINAL_IMAGE"
+    qemu-img check "$ADOPT_FINAL_IMAGE" >/dev/null || die "QCOW2 adotado inválido"
+    ok "QCOW2 final adotado é válido."
+  fi
+
+  switch_tenant "$TARGET_TENANT"
+  if [[ -n "$ADOPT_CUSTOM_IMAGE_ID" ]]; then
+    mgc virtual-machine images custom get --id "$ADOPT_CUSTOM_IMAGE_ID" --region "$TARGET_REGION" >/dev/null \
+      || die "Custom Image adotada não é acessível"
+    ok "Custom Image adotada acessível."
+  fi
+  if [[ -z "$ADOPT_VM_ID" ]]; then
+    tmp="$(mktemp)"; mgc profile ssh-keys list -o json -r >"$tmp" 2>&1 || die "Falha ao listar SSH keys"
+    clean_cli_text "$tmp" | grep -Fq "$TARGET_SSH_KEY" || { clean_cli_text "$tmp" | sed -n '1,120p'; rm -f "$tmp"; die "SSH key '$TARGET_SSH_KEY' não encontrada"; }
+    rm -f "$tmp"; ok "SSH key destino encontrada."
+  fi
+  echo
+  ok "Preflight concluído. Nenhum recurso foi criado."
+  echo "Rode o mesmo comando com --execute."
+  exit 0
+fi
+
+# -------- initialize state --------
+if [[ "$RESUME" -eq 0 ]]; then
+  if [[ -z "$WORKDIR" ]]; then WORKDIR="$(pwd)/mgc-vm-clone-${TARGET_NAME}-$(date +%Y%m%d-%H%M%S)"; fi
+  mkdir -p "$WORKDIR/logs" "$WORKDIR/artifacts" "$WORKDIR/export"
+  WORKDIR="$(readlink -f "$WORKDIR")"; STATE="$WORKDIR/state.json"; LOG_DIR="$WORKDIR/logs"
+  [[ ! -e "$STATE" ]] || die "State já existe em $STATE. Use --resume $WORKDIR"
+  jq -n \
+    --arg version "$VERSION" --arg created "$(date -Iseconds)" \
+    --arg st "$SOURCE_TENANT" --arg sv "$SOURCE_VM" --arg sr "$SOURCE_REGION" --arg sh "$SOURCE_SSH_HOST" --arg su "$SOURCE_SSH_USER" --arg sk "$SOURCE_SSH_KEY" \
+    --arg tt "$TARGET_TENANT" --arg tr "$TARGET_REGION" --arg tn "$TARGET_NAME" --arg ci "$CUSTOM_IMAGE_NAME" --arg tv "$TARGET_VM_NAME" --arg az "$TARGET_AZ" --arg vpc "$TARGET_VPC" --arg tkey "$TARGET_SSH_KEY" --arg mt "$TARGET_MACHINE_TYPE" --arg sg "$SECURITY_GROUP_ID" --arg ident "$IDENTITY_FILE" --arg vh "$VALIDATION_HOST" \
+    --argjson pub "$([[ "$ASSOCIATE_PUBLIC_IP" -eq 1 ]] && echo true || echo false)" --argjson skip "$([[ "$SKIP_VALIDATION" -eq 1 ]] && echo true || echo false)" \
+    '{schema:"mgc-vm-clone/v1",version:$version,created_at:$created,updated_at:$created,
+      config:{source_tenant:$st,source_vm:$sv,source_region:$sr,source_ssh_host:$sh,source_ssh_user:$su,source_ssh_key:$sk,
+              target_tenant:$tt,target_region:$tr,target_name:$tn,custom_image_name:$ci,target_vm_name:$tv,target_az:$az,target_vpc:$vpc,target_ssh_key:$tkey,target_machine_type:$mt,security_group_id:$sg,identity_file:$ident,validation_host:$vh,associate_public_ip:$pub,skip_validation:$skip},
+      phases:{export:"pending",sanitize:"pending",import:"pending",machine_type:"pending",create_vm:"pending",validate:"pending"},source:{},requirements:{},artifacts:{},result:{}}' >"$STATE"
+
+  if [[ -n "$ADOPT_FINAL_IMAGE" ]]; then
+    ADOPT_FINAL_IMAGE="$(readlink -f "$ADOPT_FINAL_IMAGE")"
+    state_set_string '.artifacts.final_image' "$ADOPT_FINAL_IMAGE"
+    phase_set export adopted; phase_set sanitize done
+  fi
+  if [[ -n "$ADOPT_CUSTOM_IMAGE_ID" ]]; then
+    state_set_string '.artifacts.custom_image_id' "$ADOPT_CUSTOM_IMAGE_ID"
+    phase_set export adopted; phase_set sanitize adopted; phase_set import done
+  fi
+  if [[ -n "$ADOPT_VM_ID" ]]; then
+    state_set_string '.artifacts.target_vm_id' "$ADOPT_VM_ID"
+    [[ -n "$TARGET_MACHINE_TYPE" ]] && state_set_string '.artifacts.target_machine_type' "$TARGET_MACHINE_TYPE"
+    phase_set export adopted; phase_set sanitize adopted; phase_set import adopted; phase_set machine_type adopted; phase_set create_vm running
+  fi
+fi
+
+# state may have been created after trap variables were initially set
+STATE="$WORKDIR/state.json"; LOG_DIR="$WORKDIR/logs"
+
+# -------- source machine-id --------
+if [[ -z "$(state_get '.source.machine_id')" && -n "$SOURCE_SSH_HOST" ]]; then
+  switch_tenant "$SOURCE_TENANT"
+  mid="$(capture_source_machine_id)"
+  [[ -n "$mid" ]] && state_set_string '.source.machine_id' "$mid"
+fi
+
+# -------- phase 1: export --------
+if [[ "$(phase export)" == "pending" || "$(phase export)" == "running" ]]; then
+  # Recovery: if metadata/QCOW already exist, trust only after qemu-img check.
+  if [[ -f "$WORKDIR/export/metadata.json" ]]; then
+    rel="$(jq -r '.artifact.qcow2 // empty' "$WORKDIR/export/metadata.json")"
+    if [[ -n "$rel" && -f "$WORKDIR/export/$rel" ]] && qemu-img check "$WORKDIR/export/$rel" >/dev/null 2>&1; then
+      ok "Export encontrado no checkpoint; reutilizando."
+      phase_set export done
+    fi
+  fi
+fi
+
+if [[ "$(phase export)" == "pending" || "$(phase export)" == "running" ]]; then
+  phase_set export running
+  switch_tenant "$SOURCE_TENANT"
+  args=(--vm "$SOURCE_VM" --region "$SOURCE_REGION" --ssh-host "$SOURCE_SSH_HOST" --ssh-user "$SOURCE_SSH_USER" --output-dir "$WORKDIR/export" --execute)
+  [[ -n "$SOURCE_SSH_KEY" ]] && args+=(--ssh-key "$SOURCE_SSH_KEY")
+  [[ "$QUIESCE_DOCKER" -eq 1 ]] && args+=(--quiesce-docker)
+  if [[ -n "$SNAPSHOT_ID" ]]; then args+=(--snapshot-id "$SNAPSHOT_ID"); elif [[ "$SAFETY_SNAPSHOT" -eq 1 ]]; then args+=(--safety-snapshot); fi
+  log "[1/8] Exportando disco da VM de origem..."
+  if ! "$LIB_DIR/export.sh" "${args[@]}" 2>&1 | tee "$LOG_DIR/01-export.log"; then
+    phase_set export failed; die "Export falhou. Retome com --resume $WORKDIR"
+  fi
+  phase_set export done
+fi
+
+if [[ "$(phase export)" == "done" ]]; then
+  meta="$WORKDIR/export/metadata.json"
+  [[ -f "$meta" ]] || die "metadata.json do export ausente"
+  rel="$(jq -r '.artifact.qcow2' "$meta")"; source_img="$WORKDIR/export/$rel"
+  [[ -f "$source_img" ]] || die "QCOW2 exportado ausente: $source_img"
+  state_set_string '.artifacts.source_image' "$source_img"
+  state_set_string '.source.machine_type' "$(jq -r '.source.machine_type // empty' "$meta")"
+  state_set_string '.artifacts.snapshot_id' "$(jq -r '.safety_snapshot.id // empty' "$meta")"
+fi
+
+# -------- phase 2: sanitize --------
+if [[ "$(phase sanitize)" == "pending" || "$(phase sanitize)" == "running" ]]; then
+  final_img="$WORKDIR/artifacts/${TARGET_NAME}-portable-mgc.qcow2"
+  if [[ -f "$final_img" ]] && qemu-img check "$final_img" >/dev/null 2>&1; then
+    ok "Imagem final encontrada no checkpoint; reutilizando."
+    state_set_string '.artifacts.final_image' "$final_img"; phase_set sanitize done
+  fi
+fi
+
+if [[ "$(phase sanitize)" == "pending" || "$(phase sanitize)" == "running" ]]; then
+  phase_set sanitize running
+  source_img="$(state_get '.artifacts.source_image')"
+  portable="$WORKDIR/artifacts/${TARGET_NAME}-portable.qcow2"
+  final_img="$WORKDIR/artifacts/${TARGET_NAME}-portable-mgc.qcow2"
+  log "[2/8] Sanitizando imagem offline..."
+  "$LIB_DIR/prepare.sh" --source "$source_img" --output "$portable" --execute 2>&1 | tee "$LOG_DIR/02-prepare.log" \
+    || { phase_set sanitize failed; die "Sanitização falhou. Retome com --resume $WORKDIR"; }
+  log "[3/8] Removendo rede/MAC herdados..."
+  "$LIB_DIR/fix-network.sh" --source "$portable" --output "$final_img" --execute 2>&1 | tee "$LOG_DIR/03-fix-network.log" \
+    || { phase_set sanitize failed; die "Ajuste de rede falhou. Retome com --resume $WORKDIR"; }
+  "$LIB_DIR/validate-portable.sh" --image "$final_img" 2>&1 | tee "$LOG_DIR/04-validate-portable.log" \
+    || { phase_set sanitize failed; die "Validação da imagem portável falhou."; }
+  state_set_string '.artifacts.final_image' "$final_img"
+  phase_set sanitize done
+fi
+
+# Requirements as soon as a local final image exists.
+final_img="$(state_get '.artifacts.final_image')"
+if [[ -n "$final_img" && -f "$final_img" ]]; then
+  source_mt="$(state_get '.source.machine_type')"
+  calc_requirements "$final_img" "$source_mt"
+elif [[ "$(phase import)" != "done" && "$(phase import)" != "adopted" ]]; then
+  die "Sem imagem final local para calcular requisitos."
+fi
+
+# -------- phase 3: import custom image --------
+if [[ "$(phase import)" == "pending" || "$(phase import)" == "failed" || "$(phase import)" == "running" ]]; then
+  existing_id="$(state_get '.artifacts.custom_image_id')"
+  if [[ -n "$existing_id" ]]; then
+    switch_tenant "$TARGET_TENANT"
+    if mgc virtual-machine images custom get --id "$existing_id" --region "$TARGET_REGION" -o json -r >"$LOG_DIR/custom-get-check.log" 2>&1; then
+      if clean_cli_text "$LOG_DIR/custom-get-check.log" | grep -qiE '"?status"?[ :]+"?active|status:[[:space:]]*active'; then
+        ok "Custom Image já está ACTIVE no checkpoint."
+        phase_set import done
+      fi
+    fi
+  fi
+fi
+
+if [[ "$(phase import)" == "pending" || "$(phase import)" == "failed" || "$(phase import)" == "running" ]]; then
+  phase_set import running
+  bucket="$(state_get '.artifacts.bucket')"
+  log "[5/8] Importando Custom Image no tenant destino..."
+  if [[ -n "$bucket" ]]; then
+    cmd=("$LIB_DIR/import-resume.sh" --image "$final_img" --tenant "$TARGET_TENANT" --region "$TARGET_REGION" --name "$CUSTOM_IMAGE_NAME" --disk "$REQ_DISK" --ram "$REQ_RAM" --vcpu "$REQ_VCPU" --resume-bucket "$bucket" --timeout 180 --execute)
+  else
+    cmd=("$LIB_DIR/import.sh" --image "$final_img" --tenant "$TARGET_TENANT" --region "$TARGET_REGION" --name "$CUSTOM_IMAGE_NAME" --disk "$REQ_DISK" --ram "$REQ_RAM" --vcpu "$REQ_VCPU" --execute)
+  fi
+  set +e
+  "${cmd[@]}" 2>&1 | tee "$LOG_DIR/05-import.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    bucket="$(sed -nE 's/.*Bucket mantido para diagnóstico:[[:space:]]*([^[:space:]]+).*/\1/p; s/.*Criando bucket privado temporário:[[:space:]]*([^[:space:]]+).*/\1/p' "$LOG_DIR/05-import.log" | tail -n1)"
+    [[ -n "$bucket" ]] && state_set_string '.artifacts.bucket' "$bucket"
+    rid="$(sed -nE 's/.*Request ID:[[:space:]]*([^[:space:]]+).*/\1/p' "$LOG_DIR/05-import.log" | tail -n1)"
+    tid="$(sed -nE 's/.*MGC Trace ID:[[:space:]]*([^[:space:]]+).*/\1/p' "$LOG_DIR/05-import.log" | tail -n1)"
+    [[ -n "$rid" ]] && state_set_string '.result.last_request_id' "$rid"
+    [[ -n "$tid" ]] && state_set_string '.result.last_trace_id' "$tid"
+    phase_set import failed
+    warn "Importação parou, mas o checkpoint foi preservado."
+    [[ -n "$bucket" ]] && warn "Bucket preservado: $bucket"
+    warn "Retome com: ./mgc-vm-clone --resume $WORKDIR"
+    warn "Se o nome ficar preso em 409, use também --new-custom-image-name <novo-nome>."
+    exit "$rc"
+  fi
+  cid="$(sed -nE 's/.*Custom Image ID:[[:space:]]*([0-9a-fA-F-]{36}).*/\1/p; s/.*ID capturado diretamente:[[:space:]]*([0-9a-fA-F-]{36}).*/\1/p' "$LOG_DIR/05-import.log" | tail -n1)"
+  [[ -n "$cid" ]] || die "Import terminou sem conseguir extrair Custom Image ID. Veja $LOG_DIR/05-import.log"
+  state_set_string '.artifacts.custom_image_id' "$cid"
+  state_set_string '.artifacts.bucket' ''
+  phase_set import done
+fi
+
+# -------- phase 4: machine type --------
+if [[ "$(phase machine_type)" == "pending" || "$(phase machine_type)" == "running" ]]; then
+  phase_set machine_type running
+  select_machine_type
+  phase_set machine_type done
+fi
+TARGET_MACHINE_TYPE="$(state_get '.artifacts.target_machine_type')"
+
+# -------- phase 5: create/recover VM --------
+if [[ "$(phase create_vm)" == "pending" || "$(phase create_vm)" == "failed" || "$(phase create_vm)" == "running" ]]; then
+  vmid="$(state_get '.artifacts.target_vm_id')"
+  if [[ -n "$vmid" ]]; then
+    log "[7/8] Recuperando VM já criada pelo ID $vmid..."
+    ips="$(poll_vm_by_id "$vmid")"
+    pub="$(awk -F'|' '$1=="public"{print $2;exit}' <<<"$ips")"
+    priv="$(awk -F'|' '$1=="private"{print $2;exit}' <<<"$ips")"
+    state_set_string '.artifacts.public_ip' "$pub"; state_set_string '.artifacts.private_ip' "$priv"
+    phase_set create_vm done
+  fi
+fi
+
+if [[ "$(phase create_vm)" == "pending" || "$(phase create_vm)" == "failed" || "$(phase create_vm)" == "running" ]]; then
+  phase_set create_vm running
+  cid="$(state_get '.artifacts.custom_image_id')"
+  log "[7/8] Criando VM destino..."
+  cmd=("$LIB_DIR/create-vm.sh" --tenant "$TARGET_TENANT" --image-id "$cid" --name "$TARGET_VM_NAME" --region "$TARGET_REGION" --machine-type "$TARGET_MACHINE_TYPE" --az "$TARGET_AZ" --vpc-name "$TARGET_VPC" --ssh-key "$TARGET_SSH_KEY" --execute)
+  [[ "$ASSOCIATE_PUBLIC_IP" -eq 0 ]] && cmd+=(--no-public-ip)
+  [[ -n "$SECURITY_GROUP_ID" ]] && cmd+=(--security-group-id "$SECURITY_GROUP_ID")
+  set +e
+  "${cmd[@]}" 2>&1 | tee "$LOG_DIR/07-create-vm.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  vmid="$(sed -nE 's/.*VM criada: ID=([0-9a-fA-F-]{36}).*/\1/p; s/^ID:[[:space:]]*([0-9a-fA-F-]{36}).*/\1/p' "$LOG_DIR/07-create-vm.log" | tail -n1)"
+  [[ -n "$vmid" ]] && state_set_string '.artifacts.target_vm_id' "$vmid"
+  if [[ "$rc" -ne 0 ]]; then phase_set create_vm failed; die "Criação/espera da VM falhou. Retome com --resume $WORKDIR"; fi
+  [[ -n "$vmid" ]] || die "Não consegui extrair ID da VM criada."
+  pub="$(sed -nE 's/^Public IP:[[:space:]]*([^[:space:]]+).*/\1/p' "$LOG_DIR/07-create-vm.log" | tail -n1)"
+  priv="$(sed -nE 's/^Private IP:[[:space:]]*([^[:space:]]+).*/\1/p' "$LOG_DIR/07-create-vm.log" | tail -n1)"
+  state_set_string '.artifacts.public_ip' "$pub"; state_set_string '.artifacts.private_ip' "$priv"
+  phase_set create_vm done
+fi
+
+# -------- phase 6: validate --------
+if [[ "$SKIP_VALIDATION" -eq 1 ]]; then
+  phase_set validate skipped
+elif [[ "$(phase validate)" != "done" ]]; then
+  phase_set validate running
+  host="$VALIDATION_HOST"
+  [[ -n "$host" ]] || host="$(state_get '.artifacts.public_ip')"
+  [[ -n "$host" && "$host" != "não" && "$host" != "não identificado" ]] || host="$(state_get '.artifacts.private_ip')"
+  [[ -n "$host" ]] || { phase_set validate failed; die "Não identifiquei host para validação; use --validation-host em nova execução/estado."; }
+  oldmid="$(state_get '.source.machine_id')"
+  cmd=("$LIB_DIR/validate-clone.sh" --host "$host" --user "$SOURCE_SSH_USER")
+  [[ -n "$IDENTITY_FILE" ]] && cmd+=(--identity-file "$IDENTITY_FILE")
+  [[ -n "$oldmid" ]] && cmd+=(--old-machine-id "$oldmid")
+  log "[8/8] Validando clone em $host..."
+  "${cmd[@]}" 2>&1 | tee "$LOG_DIR/08-validate.log" \
+    || { phase_set validate failed; die "VM foi criada, mas validação SSH falhou. Retome com --resume $WORKDIR"; }
+  phase_set validate done
+fi
+
+state_set_string '.updated_at' "$(date -Iseconds)"
+state_set_string '.result.status' 'success'
+
+cat <<SUMMARY
+
+============================================================
+ MGC VM CLONE v$VERSION - SUCESSO
+============================================================
+Workdir:         $WORKDIR
+State:           $STATE
+Custom Image ID: $(state_get '.artifacts.custom_image_id')
+Machine type:    $(state_get '.artifacts.target_machine_type')
+VM ID:           $(state_get '.artifacts.target_vm_id')
+Private IP:       $(state_get '.artifacts.private_ip')
+Public IP:        $(state_get '.artifacts.public_ip')
+Final QCOW2:      $(state_get '.artifacts.final_image')
+Snapshot safety:  $(state_get '.artifacts.snapshot_id')
+
+Para consultar depois:
+  ./mgc-vm-clone --status $WORKDIR
+SUMMARY

@@ -1,0 +1,39 @@
+# VM artifacts - never commit
+*.qcow2
+*.raw
+*.img
+*.iso
+*.zst
+*.zstd
+*.snapshot
+
+# Runtime/checkpoint state
+state.json
+logs/
+workdir/
+artifacts/
+export/
+*.log
+
+# Credentials / local configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*
+secrets*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*~
+*.swp
+
+# Archives generated locally
+*.tar.gz
+*.zip
